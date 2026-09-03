@@ -1,0 +1,75 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gamestore
+      POSTGRES_PASSWORD: gamestore
+      POSTGRES_DB: gamestore_core
+    ports: ["5433:5432"]
+    volumes:
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gamestore -d gamestore_core"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Две заглушки-поставщика - отдельные процессы, чтобы «поставщик недоступен»
+  # означал настоящий connection refused, а не смоделированный флаг.
+  supplier-a: &supplier
+    build: .
+    command: uvicorn suppliers.main:app --host 0.0.0.0 --port 9000
+    environment: &env
+      DATABASE_URL: postgresql+asyncpg://gamestore:gamestore@db:5432/gamestore_core
+      SUPPLIER_DATABASE_URL: postgresql+asyncpg://gamestore:gamestore@db:5432/gamestore_suppliers
+      SUPPLIER_A_URL: http://supplier-a:9000
+      SUPPLIER_B_URL: http://supplier-b:9000
+    ports: ["9101:9000"]
+    depends_on:
+      db: {condition: service_healthy}
+
+  supplier-b:
+    <<: *supplier
+    ports: ["9102:9000"]
+
+  seed:
+    build: .
+    command: python -m scripts.seed --reset
+    environment: *env
+    depends_on:
+      db: {condition: service_healthy}
+    restart: "no"
+
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment:
+      <<: *env
+      WORKER_ENABLED: "1"      # воркер внутри процесса API; можно вынести в сервис worker
+    ports: ["8000:8000"]
+    depends_on:
+      db: {condition: service_healthy}
+      seed: {condition: service_completed_successfully}
+      supplier-a: {condition: service_started}
+      supplier-b: {condition: service_started}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Отдельный воркер: очередь разбирается через FOR UPDATE SKIP LOCKED,
+  # поэтому реплик можно поднять сколько угодно. Запуск: --profile worker
+  worker:
+    build: .
+    command: python -m app.worker
+    environment: *env
+    depends_on:
+      api: {condition: service_healthy}
+    profiles: ["worker"]
+    deploy:
+      replicas: 2
+
+volumes:
+  pgdata:
