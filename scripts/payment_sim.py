@@ -14,7 +14,7 @@
     # вебхук раньше заказа (критерий 3)
     python -m scripts.payment_sim pay --order ord_does_not_exist_yet
 
-    # полный сквозной сценарий: создать заказ -> 50 вебхуков -> дождаться выдачи
+    # сквозной сценарий: заказ, 50 вебхуков, ожидание выдачи
     python -m scripts.payment_sim scenario --sku KEY-CS2-PRIME --concurrency 50
 """
 from __future__ import annotations
@@ -137,7 +137,7 @@ async def cmd_scenario(args) -> None:
         args.api, order["id"], order["amount"], order["currency"],
         args.concurrency, args.same_event, "paid",
     )
-    print(f"{args.concurrency} webhooks in {time.monotonic()-t0:.2f}s -> "
+    print(f"{args.concurrency} webhooks in {time.monotonic()-t0:.2f}s: "
           f"{json.dumps(summarize(results), ensure_ascii=False)}")
 
     async with httpx.AsyncClient(timeout=60.0) as client:

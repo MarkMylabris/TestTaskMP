@@ -14,10 +14,9 @@ router = APIRouter(tags=["webhooks"])
 async def payment_webhook(body: PaymentWebhook, session: AsyncSession = Depends(get_session)):
     """Вебхук платёжной системы.
 
-    Отвечает быстро: внутри только БД, никаких походов к поставщикам.
-    Всегда 200, если событие принято - иначе платёжка будет ретраить то,
-    что мы уже сохранили. 5xx отдаём только при реальном сбое БД (тогда
-    ретрай платёжки - именно то, что нужно).
+    Внутри только БД, никаких походов к поставщикам. 200, если событие
+    принято, иначе платёжка будет ретраить уже сохранённое; 5xx только при
+    реальном сбое БД - тогда ретрай и нужен.
     """
     if body.status not in ("paid", "failed"):
         raise HTTPException(status_code=422, detail="status must be 'paid' or 'failed'")

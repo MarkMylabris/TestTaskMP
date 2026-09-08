@@ -1,9 +1,7 @@
-"""Поднимает настоящий стек: два поставщика и API, каждый своим процессом,
-на отдельных портах и отдельных базах.
+"""Стек для тестов: два поставщика и API, каждый своим процессом.
 
-Тесты ходят по живому HTTP, а не через ASGI-транспорт. Это дольше, но иначе
-нечего проверять: ни гонка на SELECT FOR UPDATE, ни read timeout к поставщику
-на моках не воспроизводятся, а весь смысл задания именно в них.
+Тесты ходят по живому HTTP, а не через ASGI-транспорт: ни гонка на FOR UPDATE,
+ни read timeout к поставщику на моках не воспроизводятся.
 """
 from __future__ import annotations
 
@@ -41,7 +39,7 @@ ENV = {
         f"postgresql+asyncpg://gamestore:gamestore@127.0.0.1:5432/{SUP_DB}",
     "SUPPLIER_A_URL": SUP_A,
     "SUPPLIER_B_URL": SUP_B,
-    # Быстрые таймауты, чтобы сценарии этапа 3 укладывались в секунды.
+    # Быстрые таймауты, чтобы сценарии укладывались в секунды.
     "SUPPLIER_READ_TIMEOUT": "1.0",
     "SUPPLIER_CONNECT_TIMEOUT": "0.5",
     "SUPPLIER_MAX_ATTEMPTS": "2",
@@ -52,6 +50,8 @@ ENV = {
     "SWEEPER_INTERVAL": "1.0",
     "STUCK_ORDER_SECONDS": "3",
     "DELIVERY_MAX_ATTEMPTS": "20",
+    # Лимит поставщика: 20 запросов в секунду с запасом.
+    "SUPPLIER_RATE_LIMIT_PER_MIN": "1200",
     "LOG_LEVEL": "WARNING",
 }
 
@@ -91,9 +91,11 @@ def _spawn(module: str, port: int) -> subprocess.Popen:
 @pytest.fixture(scope="session")
 def stack():
     asyncio.run(_ensure_databases())
+    # Запас ключей на каждый SKU: иначе тесты зависят друг от друга через
+    # общий пул, и падает не тот, кто виноват.
     subprocess.run(
-        [PY, "-m", "scripts.seed", "--reset"], cwd=ROOT, env=ENV, check=True,
-        stdout=subprocess.DEVNULL,
+        [PY, "-m", "scripts.seed", "--reset", "--extra", "40"], cwd=ROOT, env=ENV,
+        check=True, stdout=subprocess.DEVNULL,
     )
 
     procs = {
@@ -125,13 +127,14 @@ async def api(stack):
 
 @pytest.fixture(autouse=True)
 async def reset_suppliers(stack):
-    """Перед каждым тестом поставщики в детерминированном режиме "всё ок"."""
+    """Перед каждым тестом поставщики в режиме "всё ок"."""
     async with httpx.AsyncClient(timeout=10.0) as c:
         for base, s in ((SUP_A, "a"), (SUP_B, "b")):
             await c.post(f"{base}/{s}/_control", json={
                 "mode": "ok", "error_rate": 0.0, "timeout_rate": 0.0,
                 "hang_seconds": 3.0, "latency_ms": 0, "out_of_stock_skus": [],
-                "probe_hangs": False,
+                "unsupported_skus": [], "probe_hangs": False,
+                "rate_limit": 0, "rate_window_seconds": 1.0,
             })
     yield
 
@@ -150,6 +153,25 @@ async def restock(supplier: str, sku: str, count: int = 5) -> None:
     async with httpx.AsyncClient(timeout=10.0) as c:
         r = await c.post(f"{base}/{supplier}/_restock", json={"sku": sku, "count": count})
         r.raise_for_status()
+
+
+async def supplier_stats(supplier: str) -> dict:
+    base = SUP_A if supplier == "a" else SUP_B
+    async with httpx.AsyncClient(timeout=10.0) as c:
+        r = await c.get(f"{base}/{supplier}/_stats")
+        r.raise_for_status()
+        return r.json()
+
+
+async def reset_supplier_stats(supplier: str) -> None:
+    base = SUP_A if supplier == "a" else SUP_B
+    async with httpx.AsyncClient(timeout=10.0) as c:
+        (await c.post(f"{base}/{supplier}/_stats/reset")).raise_for_status()
+
+
+async def core_db():
+    """Прямое подключение к ядру: проверки вне HTTP-контракта."""
+    return await asyncpg.connect(f"{PG_DSN}/{CORE_DB}")
 
 
 async def supplier_request(supplier: str, request_id: str) -> httpx.Response:
@@ -186,5 +208,17 @@ async def wait_status(
 
 async def timeline(api: httpx.AsyncClient, order_id: str) -> dict:
     r = await api.get(f"/admin/orders/{order_id}/timeline")
+    r.raise_for_status()
+    return r.json()
+
+
+async def create_multi_order(
+    api: httpx.AsyncClient, items: list[dict], order_id: str | None = None
+) -> dict:
+    """Заказ из нескольких товаров."""
+    body: dict = {"items": items}
+    if order_id:
+        body["order_id"] = order_id
+    r = await api.post("/orders", json=body)
     r.raise_for_status()
     return r.json()

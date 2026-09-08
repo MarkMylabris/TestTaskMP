@@ -1,11 +1,8 @@
-"""Фоновый воркер: разбор очереди плюс доводчик зависших заказов.
+"""Фоновый воркер: разбор очереди и доводчик зависших заказов.
 
-Живёт либо внутри процесса API (WORKER_ENABLED=1), либо отдельно:
-
-    python -m app.worker
-
-Реплик можно поднять сколько угодно: очередь разбирается через FOR UPDATE
-SKIP LOCKED, задачи между процессами не задваиваются.
+Живёт внутри процесса API (WORKER_ENABLED=1) либо отдельно: python -m app.worker.
+Реплик можно поднять сколько угодно - очередь разбирается через FOR UPDATE
+SKIP LOCKED.
 """
 from __future__ import annotations
 
@@ -20,7 +17,7 @@ from sqlalchemy import text
 from app.config import settings
 from app.db import session_scope
 from app.logging_conf import configure_logging, get_logger
-from app.services import jobs, payments
+from app.services import jobs, payments, ratelimit, settlement
 from app.services.delivery import deliver_order
 from app.services.supplier_client import SUPPLIER_URLS, SupplierClient
 
@@ -34,15 +31,25 @@ async def handle_deliver(job: dict, client: SupplierClient) -> tuple[str, timede
     order_id = job["payload"]["order_id"]
     result = await deliver_order(order_id, client)
 
-    if result.status in ("delivered", "skipped"):
+    if result.status in ("delivered", "settled", "skipped"):
         return "done", None, result.note or result.status
 
+    if result.status == "throttled":
+        # Лимит поставщика: задача возвращается в очередь, не тратя попытку.
+        return "throttle", result.retry_after or timedelta(seconds=1), (
+            result.note or "supplier rate limit"
+        )
+
     if job["attempts"] >= settings.delivery_max_attempts:
-        # Дальше - ручной разбор; заказ остаётся в восстановимом статусе,
-        # его видно в /admin/reconciliation.
+        # Бюджет исчерпан. Заказ не бросаем: выданное остаётся у покупателя,
+        # за невыданное ставим возврат, и заказ приходит к конечному статусу.
+        async with session_scope() as s:
+            settled = await settlement.settle_order(
+                s, order_id, reason="delivery attempts exhausted"
+            )
         log.error(
             "delivery.giving_up", order_id=order_id, attempts=job["attempts"],
-            status=result.status, note=result.note,
+            status=result.status, note=result.note, refunds_scheduled=settled,
         )
         return "failed", None, f"{result.status}: {result.note}"
 
@@ -64,7 +71,7 @@ async def handle_orphans(job: dict, client: SupplierClient) -> tuple[str, timede
 
 
 async def handle_sync_stock(job: dict, client: SupplierClient) -> tuple[str, timedelta | None, str]:
-    """Обновить снимок остатков витрины из поставщиков (этап 5)."""
+    """Обновить снимок остатков витрины из поставщиков."""
     totals: dict[str, int] = {}
     async with httpx.AsyncClient(timeout=5.0) as http:
         for supplier, base in SUPPLIER_URLS.items():
@@ -99,8 +106,24 @@ async def handle_sync_stock(job: dict, client: SupplierClient) -> tuple[str, tim
     return "done", None, f"skus={len(totals)}"
 
 
+async def handle_refund_item(
+    job: dict, client: SupplierClient
+) -> tuple[str, timedelta | None, str]:
+    """Вернуть деньги за позицию и досвести заказ.
+
+    Идемпотентен: повтор не проводит второй возврат.
+    """
+    item_id = job["payload"]["item_id"]
+    order_id = job["payload"]["order_id"]
+    reason = job["payload"].get("reason", "unspecified")
+    refunded = await settlement.refund_item(item_id, reason)
+    final = await settlement.finalize_order(order_id)
+    return "done", None, f"refunded={refunded} order={final}"
+
+
 HANDLERS = {
     jobs.KIND_DELIVER: handle_deliver,
+    jobs.KIND_REFUND_ITEM: handle_refund_item,
     jobs.KIND_APPLY_ORPHAN: handle_orphans,
     jobs.KIND_SYNC_STOCK: handle_sync_stock,
 }
@@ -117,13 +140,17 @@ async def _run_job(job: dict, client: SupplierClient, sem: asyncio.Semaphore) ->
                 outcome, delay, note = "failed", None, f"unknown job kind {job['kind']}"
             else:
                 outcome, delay, note = await handler(job, client)
-        except Exception as exc:  # noqa: BLE001 - задача не должна ронять воркер
+        except Exception as exc:  # noqa: BLE001 - задача не роняет воркер
             log.exception("job.error", job_id=job["id"], kind=job["kind"], error=repr(exc))
             outcome, delay, note = "retry", jobs.backoff_delay(job["attempts"]), repr(exc)
 
         async with session_scope() as s:
             if outcome == "done":
                 await jobs.finish(s, job["id"])
+            elif outcome == "throttle":
+                await jobs.requeue_without_penalty(
+                    s, job["id"], delay or timedelta(seconds=1), note
+                )
             elif outcome == "retry":
                 await jobs.reschedule(s, job["id"], delay or timedelta(seconds=1), note)
             else:
@@ -155,7 +182,7 @@ async def worker_loop(stop: asyncio.Event) -> None:
 SWEEP_STUCK = text(
     """
     SELECT id FROM orders
-     WHERE status NOT IN ('delivered','payment_failed')
+     WHERE status NOT IN ('delivered','partially_delivered','refunded','payment_failed')
        AND paid_at IS NOT NULL
        AND updated_at < now() - make_interval(secs => :stuck)
      ORDER BY updated_at
@@ -186,7 +213,9 @@ async def sweeper_loop(stop: asyncio.Event) -> None:
     while not stop.is_set():
         try:
             async with session_scope() as s:
-                stuck = (await s.execute(SWEEP_STUCK, {"stuck": settings.stuck_order_seconds})).scalars().all()
+                stuck = (
+                    await s.execute(SWEEP_STUCK, {"stuck": settings.stuck_order_seconds})
+                ).scalars().all()
                 for order_id in stuck:
                     if await jobs.enqueue(
                         s, jobs.KIND_DELIVER, dedupe_key=order_id,
@@ -211,6 +240,7 @@ async def sweeper_loop(stop: asyncio.Event) -> None:
 
 async def run_forever() -> None:
     stop = asyncio.Event()
+    await ratelimit.ensure_budgets(tuple(SUPPLIER_URLS))
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):

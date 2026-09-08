@@ -43,7 +43,7 @@ async def pay(api, order: dict) -> None:
 # Критерий 4: таймаут поставщика, который на самом деле выдал код
 # --------------------------------------------------------------------------- #
 async def test_timeout_after_issue_does_not_double_issue(api):
-    """A выдаёт код и "зависает". Повтор идёт с тем же request_id -> одна выдача."""
+    """A выдаёт код и зависает. Повтор с тем же request_id: одна выдача."""
     await control("a", {"mode": "timeout_after_issue", "hang_seconds": 2.0})
     await restock("a", "KEY-EFT", 5)
 
@@ -145,7 +145,7 @@ async def test_unresolvable_timeout_blocks_fallback(api):
 
 
 # --------------------------------------------------------------------------- #
-# Критерий 5: поставщик A недоступен -> fallback на B, ровно одна выдача
+# Критерий 5: A недоступен, fallback на B, ровно одна выдача
 # --------------------------------------------------------------------------- #
 async def test_fallback_to_b_when_a_returns_error(api):
     await control("a", {"mode": "error_5xx"})
@@ -224,7 +224,7 @@ async def test_both_suppliers_flaky_still_exactly_once(api):
 
 
 # --------------------------------------------------------------------------- #
-# Критерий 6: пустой остаток -> восстановимое состояние без падения
+# Критерий 6: пустой остаток даёт восстановимое состояние
 # --------------------------------------------------------------------------- #
 async def test_out_of_stock_is_recoverable(api):
     await control("a", {"out_of_stock_skus": ["GIFT-ROBLOX-800"]})

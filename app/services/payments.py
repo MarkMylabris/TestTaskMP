@@ -1,19 +1,14 @@
-"""Обработка вебхука оплаты. Здесь живёт exactly-once из этапа 2.
+"""Обработка вебхука оплаты: exactly-once на стороне БД.
 
-Как 50 одновременных вебхуков превращаются в одну выдачу:
+Как 50 одновременных вебхуков превращаются в одну выдачу: INSERT в
+payment_events с ON CONFLICT DO NOTHING отсекает повторы по event_id, дальше
+FOR UPDATE по заказу выстраивает остальных в очередь на строке, а переход в
+paid разрешён только из created - первый выигрывает, остальные становятся
+no-op.
 
-INSERT в payment_events с ON CONFLICT (event_id) DO NOTHING отсекает повторы -
-дважды один event_id обработать физически нельзя, это первичный ключ.
-Дальше SELECT ... FOR UPDATE по заказу: вебхуки с разными event_id по одному
-заказу выстраиваются в очередь на строке. Переход created -> paid разрешён
-только из created, так что первый выигрывает, а остальные 49 видят статус,
-который уже не created, и становятся no-op.
-
-Задача выдачи ставится в очередь в этой же транзакции. Это транзакционный
-outbox: между "заказ оплачен" и "выдача запланирована" нет окна, в котором
-задачу можно было бы потерять.
-
-Наружу отвечаем быстро и без походов в сеть - к поставщику ходит воркер.
+Задача выдачи ставится в этой же транзакции (outbox): окна, в котором заказ
+оплачен, а выдача не запланирована, не существует. Наружу отвечаем быстро и
+без походов в сеть, к поставщику ходит воркер.
 """
 from __future__ import annotations
 
@@ -26,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.logging_conf import get_logger
 from app.models import PaymentEvent
-from app.services import jobs, ledger
+from app.services import events, jobs, ledger
 
 log = get_logger("payments")
 
@@ -77,7 +72,7 @@ async def handle_payment_event(
     row = (
         await session.execute(
             text(
-                "SELECT id, status, amount_minor, currency, sku "
+                "SELECT id, status, amount_minor, currency "
                 "FROM orders WHERE id = :id FOR UPDATE"
             ),
             {"id": order_id},
@@ -85,9 +80,8 @@ async def handle_payment_event(
     ).mappings().first()
 
     if row is None:
-        # Вебхук пришёл раньше, чем заказ (или заказа нет вовсе).
-        # Не 5xx: платёжка иначе будет долбить ретраями. Сохраняем как orphan
-        # и досылаем сами фоновой задачей.
+        # Вебхук пришёл раньше заказа (или заказа нет вовсе). Не 5xx, иначе
+        # платёжка завалит ретраями: сохраняем как orphan и досылаем сами.
         await _set_event_state(session, event_id, "orphan", "order not found yet")
         await jobs.enqueue(
             session, jobs.KIND_APPLY_ORPHAN, dedupe_key=order_id, payload={"order_id": order_id}
@@ -127,8 +121,8 @@ async def _apply_to_order(
     # --- 4. переходы ------------------------------------------------------ #
     if status == "paid":
         if current != "created":
-            # Повторная оплата уже оплаченного/выданного заказа - no-op.
-            # Сюда же попадают 49 из 50 параллельных вебхуков.
+            # Повтор по уже оплаченному заказу: no-op. Сюда попадают 49 из 50
+            # параллельных вебхуков.
             await _set_event_state(
                 session, event_id, "ignored", f"order already in status {current}"
             )
@@ -144,11 +138,15 @@ async def _apply_to_order(
             {"id": order_id},
         )
         await ledger.post_payment(session, order_id, amount_minor, currency)
-        # Outbox: задача выдачи в той же транзакции, что и смена статуса.
+        await events.emit(
+            session, order_id, "order_paid",
+            amount_minor=amount_minor, currency=currency, event_id=event_id,
+        )
+        # Outbox: задача выдачи в одной транзакции со сменой статуса.
         await jobs.enqueue(
             session, jobs.KIND_DELIVER, dedupe_key=order_id, payload={"order_id": order_id}
         )
-        await _set_event_state(session, event_id, "applied", "created -> paid")
+        await _set_event_state(session, event_id, "applied", "created to paid")
         log.info(
             "payment.captured", event_id=event_id, order_id=order_id,
             amount_minor=amount_minor, currency=currency, order_status="paid",
@@ -161,12 +159,13 @@ async def _apply_to_order(
             text("UPDATE orders SET status='payment_failed', updated_at=now() WHERE id=:id"),
             {"id": order_id},
         )
-        await _set_event_state(session, event_id, "applied", "created -> payment_failed")
+        await events.emit(session, order_id, "order_payment_failed", event_id=event_id)
+        await _set_event_state(session, event_id, "applied", "created to payment_failed")
         log.info("payment.failed", event_id=event_id, order_id=order_id)
         return WebhookResult(True, "applied", "payment_failed")
 
-    # Вебхук вне порядка: `failed` пришёл после `paid`/`delivered`.
-    # Финальные и оплаченные состояния не откатываем - только фиксируем аномалию.
+    # Вебхук вне порядка: `failed` после `paid`. Оплаченные состояния не
+    # откатываем, только фиксируем аномалию.
     note = f"out-of-order 'failed' for order in status {current}"
     await _set_event_state(session, event_id, "ignored", note)
     log.warning("payment.out_of_order", event_id=event_id, order_id=order_id, note=note)
@@ -184,11 +183,11 @@ async def _set_event_state(session: AsyncSession, event_id: str, state: str, not
 
 
 async def apply_orphan_events(session: AsyncSession, order_id: str) -> int:
-    """Досылка "сиротских" событий, пришедших раньше заказа (этап 2, п.3)."""
+    """Досылка событий, пришедших раньше заказа."""
     row = (
         await session.execute(
             text(
-                "SELECT id, status, amount_minor, currency, sku FROM orders "
+                "SELECT id, status, amount_minor, currency FROM orders "
                 "WHERE id=:id FOR UPDATE"
             ),
             {"id": order_id},
@@ -216,7 +215,7 @@ async def apply_orphan_events(session: AsyncSession, order_id: str) -> int:
         # Перечитываем статус: предыдущее событие могло его изменить.
         fresh = (
             await session.execute(
-                text("SELECT id, status, amount_minor, currency, sku FROM orders WHERE id=:id"),
+                text("SELECT id, status, amount_minor, currency FROM orders WHERE id=:id"),
                 {"id": order_id},
             )
         ).mappings().first()
@@ -231,23 +230,3 @@ async def apply_orphan_events(session: AsyncSession, order_id: str) -> int:
         if res.state == "applied":
             applied += 1
     return applied
-
-
-async def mark_delivered_if_issued(session: AsyncSession, order_id: str) -> bool:
-    """Если выдача уже есть - заказ обязан быть delivered (идемпотентная финализация)."""
-    code = (
-        await session.execute(
-            text("SELECT code FROM issuances WHERE order_id=:id"), {"id": order_id}
-        )
-    ).scalar_one_or_none()
-    if code is None:
-        return False
-    await session.execute(
-        text(
-            "UPDATE orders SET status='delivered', "
-            "delivered_at=COALESCE(delivered_at, now()), updated_at=now() "
-            "WHERE id=:id AND status <> 'delivered'"
-        ),
-        {"id": order_id},
-    )
-    return True

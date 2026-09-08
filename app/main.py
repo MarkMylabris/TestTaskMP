@@ -13,6 +13,8 @@ from app.api import admin, catalog, orders, webhooks
 from app.config import settings
 from app.db import create_schema, engine
 from app.logging_conf import configure_logging, get_logger
+from app.services import ratelimit
+from app.services.supplier_client import SUPPLIER_URLS
 from app.worker import sweeper_loop, worker_loop
 
 log = get_logger("api")
@@ -22,6 +24,7 @@ log = get_logger("api")
 async def lifespan(app: FastAPI):
     configure_logging()
     await create_schema()
+    await ratelimit.ensure_budgets(tuple(SUPPLIER_URLS))
 
     stop = asyncio.Event()
     tasks: list[asyncio.Task] = []

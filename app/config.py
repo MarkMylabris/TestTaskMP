@@ -27,6 +27,17 @@ class Settings(BaseSettings):
     supplier_backoff_base: float = 0.2      # секунды
     supplier_backoff_max: float = 2.0
 
+    # Лимит поставщика на запросы выдачи. Держим его на своей стороне: ловить
+    # 429 постфактум - значит уже превысить.
+    supplier_rate_limit_per_min: int = 600
+    # Запас на неточность часов и на то, что лимит у поставщика скользящий,
+    # а не привязанный к нашим окнам.
+    supplier_rate_safety: float = 0.9
+    # Всплеск, который разрешено выпустить разом. 1 - строгое равномерное
+    # расписание; больше - выше пропускная способность и выше риск задеть
+    # скользящее окно поставщика.
+    supplier_rate_burst: float = 1.0
+
     # --- worker ---
     worker_enabled: bool = True             # встроенный воркер в процессе API
     worker_poll_interval: float = 0.2

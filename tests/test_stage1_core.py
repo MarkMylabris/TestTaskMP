@@ -100,5 +100,7 @@ async def test_timeline_records_every_step(api):
     assert tl["payment_events"][0]["processing_state"] == "applied"
     assert tl["issuance"]["code"]
     assert len(tl["supplier_attempts"]) >= 1
-    # Оплата (2 строки) + себестоимость выдачи (2 строки).
-    assert len(tl["ledger_entries"]) == 4
+    # Оплата (2 строки) + гашение обязательства выдачей (2) + себестоимость (2).
+    assert len(tl["ledger_entries"]) == 6
+    kinds = {e["kind"] for e in tl["ledger_entries"]}
+    assert kinds == {"payment_captured", "delivery_settled", "delivery_cost"}
