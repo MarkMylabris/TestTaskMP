@@ -1,8 +1,7 @@
 # API
 
-Живая документация со схемами и «попробовать» - Swagger на `http://localhost:8000/docs`
-(и `/redoc`, если больше нравится он). Здесь то же самое, но с примерами и, главное,
-с объяснением поведения в неочевидных случаях: повторы, гонки, частичные отказы.
+Живая документация со схемами и Swagger на `http://localhost:8000/docs`
+(и `/redoc`, если больше нравится он). Здесь то же самое, примерами, объяснением поведения в неочевидных случаях: повторы, гонки, частичные отказы.
 
 Базовый URL по умолчанию: `http://localhost:8000`.
 Авторизации нет - это тестовое задание; в проде `/admin/*` был бы за отдельным контуром.
@@ -14,8 +13,9 @@
 - [Вебхук оплаты](#вебхук-оплаты)
 - [Каталог и витрина](#каталог-и-витрина)
 - [Админ: сверка и наблюдаемость](#админ-сверка-и-наблюдаемость)
+- [Админ: деньги и история](#админ-деньги-и-история)
 - [Служебное](#служебное)
-- [Статусы заказа](#статусы-заказа)
+- [Статусы заказа и позиции](#статусы-заказа-и-позиции)
 - [API заглушек-поставщиков](#api-заглушек-поставщиков)
 - [Сквозной сценарий целиком](#сквозной-сценарий-целиком)
 
@@ -40,7 +40,8 @@
 |-----|-------|
 | `400` / `422` | тело не прошло валидацию |
 | `404` | нет такого заказа, SKU или товара |
-| `409` | конфликт: `order_id` занят другим SKU, возврат по уже выданному заказу |
+| `409` | конфликт: `order_id` занят другим составом, возврат по уже выданному заказу |
+| `422` | нет обеих форм заказа или обе сразу, товары в разных валютах, `to` раньше `from` |
 | `500` | внутренняя ошибка (в теле - `{"detail": "internal error"}`, подробности в логах) |
 
 **Трассировка.** Каждый ответ содержит заголовок `x-request-id`. Свой можно
@@ -53,9 +54,21 @@
 
 ### `POST /orders` - создать заказ
 
+Две формы. Короткая - один товар, как в первом этапе:
+
+```json
+{ "sku": "KEY-CS2-PRIME", "customer_email": "player@example.com" }
+```
+
+Полная - несколько товаров:
+
 ```json
 {
-  "sku": "KEY-CS2-PRIME",
+  "items": [
+    { "sku": "KEY-CS2-PRIME" },
+    { "sku": "KEY-EFT" },
+    { "sku": "SUB-YT-3M", "qty": 2 }
+  ],
   "customer_email": "player@example.com",
   "order_id": "ord_my_own_id"
 }
@@ -63,71 +76,123 @@
 
 | Поле | Обяз. | Описание |
 |------|-------|----------|
-| `sku` | да | SKU из каталога |
-| `customer_email` | нет | куда отправлять код (в этом ядре только хранится) |
+| `sku` | одно из двух | SKU из каталога, короткая форма на один товар |
+| `items` | одно из двух | список `{sku, qty}`, `qty` от 1 до 20, всего до 50 позиций |
+| `customer_email` | нет | куда отправлять коды (в этом ядре только хранится) |
 | `order_id` | нет | свой идентификатор, `[A-Za-z0-9_-]{3,40}` |
 
-Про `order_id` стоит сказать отдельно. Если его не передать, id сгенерируем сами
+`sku` и `items` взаимоисключающие: передать оба или ни одного - `422`.
+`qty: 2` разворачивается в две отдельные позиции: единица товара - это один код,
+и выдаётся он своим запросом к поставщику.
+
+Про `order_id`: Если его не передать, id сгенерируем сами
 (`ord_` + 16 hex). Если передать - создание становится идемпотентным: повторный
-`POST` с тем же `order_id` и тем же SKU вернёт существующий заказ и `200` вместо
-`201`, а не заведёт второй. Это же поле позволяет воспроизвести сценарий «вебхук
-пришёл раньше заказа»: сначала шлём вебхук на заранее известный `order_id`, потом
-создаём под ним заказ.
+`POST` с тем же `order_id` и тем же составом корзины вернёт существующий заказ и
+`200` вместо `201`, а не заведёт второй. Это же поле позволяет воспроизвести
+сценарий «вебхук раньше заказа».
+
+Все товары заказа должны быть в одной валюте, иначе `422`.
 
 **`201 Created`** (или `200 OK`, если заказ уже был):
 
 ```json
 {
-  "id": "ord_59947ae410fb4f30",
-  "sku": "SUB-DISCORD-1M",
-  "amount": 399.0,
-  "amount_minor": 39900,
+  "id": "ord_1838952e8abb4d34",
+  "amount": 5780.0,
+  "amount_minor": 578000,
   "currency": "RUB",
   "status": "created",
   "delivery_attempts": 0,
   "last_error": null,
-  "created_at": "2026-08-31T08:07:25.375206Z",
+  "created_at": "2026-09-08T10:22:28.204483Z",
   "paid_at": null,
   "delivered_at": null,
+  "items": [
+    {
+      "id": "ord_1838952e8abb4d34.1",
+      "position": 1,
+      "sku": "KEY-CS2-PRIME",
+      "amount": 1290.0,
+      "amount_minor": 129000,
+      "currency": "RUB",
+      "status": "pending",
+      "supplier": null,
+      "delivery_attempts": 0,
+      "last_error": null,
+      "delivered_at": null,
+      "refunded_at": null,
+      "issuance": null
+    }
+  ],
+  "sku": null,
   "issuance": null
 }
 ```
 
+`amount_minor` заказа всегда равен сумме позиций - именно эту величину сверяет
+вебхук оплаты.
+
+Идентификатор позиции детерминированный: `<order_id>.<position>`. Он же уходит в
+`request_id` к поставщику и в ключ дедупликации фоновой задачи, поэтому переживает
+рестарт и совпадает при любом повторе.
+
+Поля `sku` и `issuance` на верхнем уровне - совместимость с однотоварным
+контрактом первого этапа. Для заказа из одной позиции там её SKU и её выдача,
+для многотоварного - `null`.
+
 Ошибки: `404` - нет такого SKU или он выключен; `409` - `order_id` уже занят
-заказом с другим SKU.
+заказом с другим составом; `422` - обе формы сразу, ни одной, или разные валюты.
 
 ```bash
 curl -sX POST localhost:8000/orders \
   -H 'content-type: application/json' \
-  -d '{"sku":"KEY-CS2-PRIME"}'
+  -d '{"items":[{"sku":"KEY-CS2-PRIME"},{"sku":"GIFT-PSN-1000"}]}'
 ```
 
-### `GET /orders/{order_id}` - заказ и выданный код
+### `GET /orders/{order_id}` - заказ, коды и возвраты
 
-Тот же объект, что и выше. После успешной выдачи заполняется `issuance`:
+Тот же объект. После выдачи у позиции заполняется `issuance`, после возврата -
+`refunded_at`. Заказ, где часть товаров выдать не удалось:
 
 ```json
 {
-  "id": "ord_59947ae410fb4f30",
-  "status": "delivered",
-  "delivery_attempts": 1,
-  "paid_at": "2026-08-31T08:07:25.536389Z",
-  "delivered_at": "2026-08-31T08:07:25.720856Z",
-  "issuance": {
-    "code": "X93K-NYAQ-GEC1",
-    "supplier": "a",
-    "request_id": "req_ord_59947ae410fb4f30-a",
-    "created_at": "2026-08-31T08:07:25.720856Z"
-  }
+  "id": "ord_1838952e8abb4d34",
+  "amount_minor": 578000,
+  "status": "partially_delivered",
+  "delivery_attempts": 4,
+  "last_error": "2 delivered, 1 refunded",
+  "paid_at": "2026-09-08T10:22:36.106492Z",
+  "delivered_at": "2026-09-08T10:22:36.872101Z",
+  "items": [
+    {
+      "id": "ord_1838952e8abb4d34.1", "position": 1, "sku": "KEY-CS2-PRIME",
+      "amount_minor": 129000, "status": "delivered", "supplier": "a",
+      "delivery_attempts": 1, "delivered_at": "2026-09-08T10:22:36.262573Z",
+      "refunded_at": null,
+      "issuance": {
+        "code": "EXTA-KEY-CS2-PRIME-00000", "supplier": "a",
+        "request_id": "req_ord_1838952e8abb4d34.1-a",
+        "created_at": "2026-09-08T10:22:36.262573Z"
+      }
+    },
+    {
+      "id": "ord_1838952e8abb4d34.2", "position": 2, "sku": "KEY-EFT",
+      "amount_minor": 349000, "status": "refunded", "supplier": null,
+      "delivery_attempts": 2, "last_error": "refunded: supplier cannot fulfil",
+      "delivered_at": null, "refunded_at": "2026-09-08T10:22:36.660340Z",
+      "issuance": null
+    }
+  ]
 }
 ```
 
-`issuance` - это и есть факт выдачи. Их у заказа не может быть двух: в БД стоит
-`UNIQUE(order_id)`, так что даже если приложение вдруг попробует, БД не даст.
+`issuance` - это факт выдачи. Их у позиции не может быть двух: в БД стоит
+`UNIQUE(order_item_id)`, и `UNIQUE(code)` сверх того не даёт одному коду уйти в
+два заказа. Даже если приложение попробует, БД не даст.
 
-`last_error` - человекочитаемая причина последней неудачи выдачи
-(`out_of_stock at all suppliers`, `unresolved supplier outcome: timeout` и т.п.).
-Поле не сбрасывается «на всякий случай», а очищается при успешной выдаче.
+`last_error` - человекочитаемая причина последней неудачи
+(`out_of_stock at all suppliers`, `not fulfillable: sku_not_supported`,
+`refunded: supplier cannot fulfil`). При успешной выдаче очищается.
 
 Ошибки: `404`.
 
@@ -215,7 +280,7 @@ python -m scripts.payment_sim race --order ord_xxx --concurrency 50 --same-event
 
 ### `GET /catalog/storefront` - список товаров с остатками
 
-Тот самый «горячий» запрос из этапа 5.
+Тот самый «горячий» запрос витрины.
 
 | Параметр | По умолчанию | Описание |
 |----------|--------------|----------|
@@ -288,8 +353,8 @@ curl -s "localhost:8000/catalog/storefront?type=key&cursor=KEY-EFT&limit=20"
 
 ```json
 {
-  "generated_at": "2026-08-31T07:48:03Z",
-  "grace_seconds": 30,
+  "generated_at": "2026-09-08T10:25:52Z",
+  "grace_seconds": 0,
   "paid_not_delivered":            { "count": 0, "items": [] },
   "delivered_not_paid":            { "count": 0, "items": [] },
   "stuck_orders":                  { "count": 0, "items": [] },
@@ -300,11 +365,27 @@ curl -s "localhost:8000/catalog/storefront?type=key&cursor=KEY-EFT&limit=20"
     "balanced": true,
     "unbalanced_transactions": [],
     "by_account": [
-      { "account": "customer",      "total":  905900 },
-      { "account": "revenue",       "total": -905900 },
-      { "account": "supplier_cost", "total":  634130 },
-      { "account": "inventory",     "total": -634130 }
+      { "account": "customer",      "total":        0 },
+      { "account": "delivered",     "total":  1629000 },
+      { "account": "refund",        "total":   349000 },
+      { "account": "revenue",       "total": -1978000 },
+      { "account": "supplier_cost", "total":  1140300 },
+      { "account": "inventory",     "total": -1140300 }
     ]
+  },
+  "money": {
+    "paid_minor": 1978000,
+    "delivered_minor": 1629000,
+    "refunded_minor": 349000,
+    "open_minor": 0,
+    "equation": "1978000 = 1629000 + 349000 + 0",
+    "balanced": true,
+    "unsettled_finished_orders": { "count": 0, "items": [] }
+  },
+  "supplier_discrepancies": {
+    "by_kind": [ { "kind": "duplicate_code", "total": 1, "open": 0 } ],
+    "open":            { "count": 0, "items": [] },
+    "needs_attention": { "count": 0, "items": [] }
   },
   "healthy": true
 }
@@ -313,20 +394,25 @@ curl -s "localhost:8000/catalog/storefront?type=key&cursor=KEY-EFT&limit=20"
 Что означает каждый раздел:
 
 - **`paid_not_delivered`** - деньги взяли, товар не отдали. Потеря для клиента,
-  самая болезненная категория. Заказ старше `grace_seconds`, оплачен, выдачи нет.
+  самая болезненная категория. Заказ старше `grace_seconds`, оплачен, есть
+  позиции, не закрытые ни кодом, ни возвратом.
 - **`delivered_not_paid`** - товар отдали, денег нет. Потеря для нас. В норме
   всегда пусто: выдача возможна только из `paid`.
 - **`stuck_orders`** - оплачен, не финализирован, давно не обновлялся. Их
   подхватывает фоновый «доводчик».
 - **`unresolved_supplier_attempts`** - попытки в состоянии `in_flight` или
-  `unknown`, по которым нет выдачи. Это заказы, где исход у внешней системы
-  неизвестен, и трогать их вслепую нельзя.
+  `unknown`, по которым нет выдачи. Исход у внешней системы неизвестен, и
+  трогать их вслепую нельзя.
 - **`orphan_payment_events`** - вебхуки, для которых заказ так и не появился.
-- **`ledger.balanced`** - сумма журнала двойной записи равна нулю. Если нет, что-то
-  очень не так; `unbalanced_transactions` покажет конкретные проводки.
+- **`ledger.balanced`** - сумма журнала двойной записи равна нулю.
+- **`money.balanced`** - выполняется ли `оплачено = выдано + возвращено + ещё не
+  закрыто`, и нет ли завершённых заказов с незакрытым обязательством.
+- **`supplier_discrepancies.needs_attention`** - открытые расхождения по уже
+  закрытым позициям. В норме пусто: расхождение закрывается, когда позиция
+  закрыта кодом или деньгами.
 
-`healthy` - короткий вердикт: нет расхождений в обе стороны и журнал сходится.
-Удобно вешать на мониторинг.
+`healthy` - короткий вердикт: нет расхождений товара, журнал сходится, денежное
+уравнение выполняется, неразобранных расхождений с поставщиками нет.
 
 ```bash
 curl -s "localhost:8000/admin/reconciliation?grace_seconds=0" | python3 -m json.tool
@@ -334,43 +420,60 @@ curl -s "localhost:8000/admin/reconciliation?grace_seconds=0" | python3 -m json.
 
 ### `GET /admin/orders/{order_id}/timeline` - вся история заказа
 
-Одним ответом: заказ, все вебхуки, все попытки к поставщикам, выдача, проводки.
-Первое, что открываешь, когда разбираешь инцидент.
+Одним ответом: заказ, позиции, вебхуки, попытки к поставщикам, расхождения,
+выдачи, проводки. Первое, что открываешь, когда разбираешь инцидент.
 
 ```json
 {
-  "order": {
-    "id": "ord_0173b64ad4f44165",
-    "sku": "GIFT-XBOX-1500",
-    "amount_minor": 150000,
-    "status": "delivered",
-    "delivery_attempts": 1,
-    "last_error": null,
-    "created_at": "...", "paid_at": "...", "delivered_at": "..."
-  },
+  "order": { "id": "ord_51295b242a9b44b0", "status": "delivered", "...": "..." },
+  "items": [
+    { "id": "ord_51295b242a9b44b0.1", "position": 1, "sku": "STEAM-TOPUP-1000",
+      "amount_minor": 100000, "status": "delivered", "supplier": "b",
+      "delivery_attempts": 1, "delivered_at": "...", "refunded_at": null }
+  ],
   "payment_events": [
-    { "event_id": "evt_5f69e31d16b3", "status": "paid",
-      "processing_state": "applied", "note": "created -> paid",
-      "event_created_at": "...", "received_at": "..." }
+    { "event_id": "evt_d3", "status": "paid", "processing_state": "applied",
+      "note": "created to paid", "event_created_at": "...", "received_at": "..." }
   ],
   "supplier_attempts": [
-    { "supplier": "a", "request_id": "req_ord_0173b64ad4f44165-a", "attempt_no": 1,
-      "state": "ok", "http_status": 200, "reason": null,
-      "code": "OODW-CCHF-MBAF", "latency_ms": 3,
-      "started_at": "...", "finished_at": "..." }
+    { "order_item_id": "ord_51295b242a9b44b0.1", "supplier": "a",
+      "request_id": "req_ord_51295b242a9b44b0.1-a", "attempt_no": 1,
+      "state": "ok", "http_status": 200, "code": "EXTA-STEAM-TOPUP-1000-00000",
+      "latency_ms": 6, "started_at": "...", "finished_at": "..." },
+    { "order_item_id": "ord_51295b242a9b44b0.1", "supplier": "b",
+      "request_id": "req_ord_51295b242a9b44b0.1-b", "attempt_no": 1,
+      "state": "ok", "http_status": 200, "code": "P3EI-W8UO-9B4K",
+      "latency_ms": 6, "started_at": "...", "finished_at": "..." }
   ],
-  "issuance": { "code": "OODW-CCHF-MBAF", "supplier": "a",
-                "request_id": "req_ord_0173b64ad4f44165-a", "created_at": "..." },
+  "supplier_discrepancies": [
+    { "order_item_id": "ord_51295b242a9b44b0.1", "supplier": "a",
+      "request_id": "req_ord_51295b242a9b44b0.1-a", "kind": "duplicate_code",
+      "code": "EXTA-STEAM-TOPUP-1000-00000",
+      "detail": "code belongs to req_ord_3df5e7ec011745da.1-a",
+      "detected_at": "...", "resolved_at": "...", "resolution": "reissued" }
+  ],
+  "issuances": [
+    { "order_item_id": "ord_51295b242a9b44b0.1", "sku": "STEAM-TOPUP-1000",
+      "code": "P3EI-W8UO-9B4K", "supplier": "b",
+      "request_id": "req_ord_51295b242a9b44b0.1-b", "created_at": "..." }
+  ],
+  "issuance": { "...": "то же самое, если позиция одна; иначе null" },
   "ledger_entries": [
-    { "kind": "payment_captured", "account": "customer",      "amount_minor":  150000 },
-    { "kind": "payment_captured", "account": "revenue",       "amount_minor": -150000 },
-    { "kind": "delivery_cost",    "account": "supplier_cost", "amount_minor":  105000 },
-    { "kind": "delivery_cost",    "account": "inventory",     "amount_minor": -105000 }
+    { "kind": "payment_captured", "item_id": "",                       "account": "customer",      "amount_minor":  100000 },
+    { "kind": "payment_captured", "item_id": "",                       "account": "revenue",       "amount_minor": -100000 },
+    { "kind": "delivery_settled", "item_id": "ord_51295b242a9b44b0.1", "account": "delivered",     "amount_minor":  100000 },
+    { "kind": "delivery_settled", "item_id": "ord_51295b242a9b44b0.1", "account": "customer",      "amount_minor": -100000 },
+    { "kind": "delivery_cost",    "item_id": "ord_51295b242a9b44b0.1", "account": "supplier_cost", "amount_minor":   70000 },
+    { "kind": "delivery_cost",    "item_id": "ord_51295b242a9b44b0.1", "account": "inventory",     "amount_minor":  -70000 }
   ]
 }
 ```
 
-`state` у попытки читается так:
+Этот пример читается так: поставщик A вернул код, который уже принадлежал
+другому запросу; мы это увидели, зафиксировали расхождение, клиенту его не
+отдали и взяли код у B. Выдача осталась одна.
+
+`state` у попытки:
 
 | `state` | Значение |
 |---------|----------|
@@ -379,8 +482,21 @@ curl -s "localhost:8000/admin/reconciliation?grace_seconds=0" | python3 -m json.
 | `failed` | поставщик точно НЕ выдавал код: соединение отвергнуто либо явная ошибка |
 | `unknown` | таймаут чтения. Код мог быть выдан. Не отказ |
 
-Разница между `failed` и `unknown` - это и есть вся суть этапа 3: из `failed`
-переключаться на резервного поставщика можно, из `unknown` - нельзя.
+Разница между `failed` и `unknown` - это разница между «безопасно переключиться
+на резервного» и «нельзя».
+
+`kind` у расхождения:
+
+| `kind` | Что случилось |
+|--------|---------------|
+| `duplicate_code` | код уже принадлежит другому запросу к поставщику |
+| `foreign_code` | код относится к другому SKU |
+| `unknown_code` | поставщик не признаёт код, который сам же прислал |
+| `code_collision` | код уже выдан другой позиции, поймал `issuances.code` UNIQUE |
+| `phantom_error` | ответил ошибкой, а код на самом деле выдал |
+
+`resolved_at` заполняется, когда позиция закрыта кодом (`reissued`,
+`code recovered by status probe`) или деньгами (`item refunded`).
 
 ### `POST /admin/orders/{order_id}/redeliver` - добить заказ руками
 
@@ -396,17 +512,71 @@ curl -s "localhost:8000/admin/reconciliation?grace_seconds=0" | python3 -m json.
 
 ### `POST /admin/orders/{order_id}/refund` - возврат
 
-Обратная проводка к оплате: `refund` +сумма, `customer` -сумма. После неё
-обязательство перед клиентом по заказу закрывается в ноль, а журнал остаётся
-сходящимся. Повторный вызов вернёт `{"refunded": false}` - `UNIQUE(order_id, kind,
-account)` не даст задвоить проводку.
+Возвращает деньги за всё невыданное в заказе: по позиции проводка
+`refund` +сумма, `customer` -сумма, статус позиции `refunded`, статус заказа
+пересчитывается. Выданные позиции остаются у покупателя.
 
-Ошибки: `404`; `409` - заказ не был оплачен или уже выдан (выданный возвращаем
-руками, автоматом такое делать нельзя).
+Это ручная кнопка для того же кода, который в фоне отрабатывает сам. Повтор
+ничего не задваивает: позиция уже `refunded`, а `UNIQUE(order_id, item_id, kind,
+account)` не даст провести вторую проводку.
+
+```json
+{
+  "order_id": "ord_xxx",
+  "refunded": true,
+  "items_refunded": ["ord_xxx.2"],
+  "order_status": "partially_delivered"
+}
+```
+
+Ошибки: `404`; `409` - заказ не был оплачен или уже выдан целиком (выданное
+возвращаем руками, автоматом такое делать нельзя).
 
 ### `GET /admin/ledger/balance` - баланс журнала
 
 Тот же блок `ledger`, что и в сверке, отдельной ручкой - чтобы вешать на алерт.
+
+### `GET /admin/discrepancies` - расхождения с поставщиками
+
+Параметр `limit`. Сводка по видам, открытые расхождения и отдельно те, что
+требуют внимания.
+
+```json
+{
+  "by_kind": [ { "kind": "duplicate_code", "total": 1, "open": 0 } ],
+  "open":            { "count": 0, "items": [] },
+  "needs_attention": { "count": 0, "items": [] }
+}
+```
+
+Открытым расхождение остаётся, только пока позиция не закрыта кодом или
+деньгами - разбор идёт сам. `needs_attention` - открытые расхождения по уже
+закрытым позициям, в норме там пусто.
+
+### `GET /admin/queue` - прогресс очереди и лимиты
+
+```json
+{
+  "queue": {
+    "waiting": 17,
+    "by_kind": [
+      { "kind": "deliver_order", "state": "running", "priority": 0, "n": 17,
+        "oldest_seconds": 0.1 }
+    ]
+  },
+  "paid_items": { "total": 29, "delivered": 11, "refunded": 1, "in_progress": 17 },
+  "suppliers": [
+    { "supplier": "a", "tokens_available": 1.0, "capacity": 1.0,
+      "rate_per_min": 540.0, "taken_total": 13, "throttled_total": 105 },
+    { "supplier": "b", "tokens_available": 1.0, "capacity": 1.0,
+      "rate_per_min": 540.0, "taken_total": 3, "throttled_total": 0 }
+  ]
+}
+```
+
+`paid_items` считает позиции оплаченных заказов: сколько всего, сколько выдано,
+сколько закрыто возвратом и сколько ещё в работе. `throttled_total` - сколько раз
+задача уходила ждать своего окна вместо запроса к поставщику; это не ошибки.
 
 ### `GET /admin/jobs` - очередь
 
@@ -414,19 +584,132 @@ account)` не даст задвоить проводку.
 
 ```json
 { "items": [
-  { "id": 59, "kind": "deliver_order", "dedupe_key": "ord_0173b64ad4f44165",
-    "state": "done", "attempts": 1, "max_attempts": 25,
-    "run_at": "...", "last_error": null }
+  { "id": 36, "kind": "deliver_order", "dedupe_key": "ord_9af79b6850f942fd",
+    "state": "done", "priority": 0, "attempts": 1, "max_attempts": 25,
+    "run_at": "2026-09-08T10:25:32.659237Z", "last_error": null }
 ] }
 ```
 
-Виды задач: `deliver_order` (выдача), `apply_orphan_events` (досылка вебхуков,
-пришедших раньше заказа), `sync_stock` (обновление витринных остатков).
+Виды задач и приоритеты (меньше - раньше):
+
+| `kind` | `priority` | Что делает |
+|--------|-----------|------------|
+| `deliver_order` | 0 | выдача позиций оплаченного заказа |
+| `refund_item` | 10 | возврат за невыданную позицию |
+| `apply_orphan_events` | 20 | досылка вебхуков, пришедших раньше заказа |
+| `sync_stock` | 50 | обновление витринных остатков |
 
 ### `GET /admin/stats` - агрегаты
 
 Заказы по статусам, события по результатам обработки, попытки по поставщикам и
-исходам, общее число выдач. Быстрый способ понять, что происходит в системе.
+исходам, общее число выдач.
+
+---
+
+## Админ: деньги и история
+
+### `GET /admin/money` - инвариант одной ручкой
+
+```json
+{
+  "paid_minor": 1978000,
+  "delivered_minor": 1629000,
+  "refunded_minor": 349000,
+  "open_minor": 0,
+  "equation": "1978000 = 1629000 + 349000 + 0",
+  "balanced": true,
+  "unsettled_finished_orders": { "count": 0, "items": [] }
+}
+```
+
+`open_minor` - деньги, за которые мы ещё не отчитались ни кодом, ни возвратом,
+то есть заказы в работе. `unsettled_finished_orders` - завершённые заказы, у
+которых обязательство перед клиентом не закрылось в ноль; каждая такая строка
+означает реальную дыру.
+
+### `GET /admin/orders/{order_id}/as-of` - состояние на прошлый момент
+
+Параметр `at` - момент в ISO-8601 (без зоны считается UTC).
+
+Состояние собирается свёрткой append-only истории, а не чтением текущих строк:
+`orders` и `order_items` переписывает каждый шаг выдачи, а история переписыванию
+не подлежит.
+
+```json
+{
+  "as_of": "2026-09-08T10:22:35+00:00",
+  "order": {
+    "id": "ord_1838952e8abb4d34",
+    "status": "created",
+    "amount_minor": 578000,
+    "currency": "RUB",
+    "items": [
+      { "id": "ord_1838952e8abb4d34.1", "sku": "KEY-CS2-PRIME",
+        "amount_minor": 129000, "status": "pending" }
+    ]
+  },
+  "money": { "paid_minor": 0, "delivered_minor": 0, "refunded_minor": 0,
+             "open_minor": 0, "equation": "0 = 0 + 0 + 0", "balanced": true },
+  "events_applied": 1,
+  "final": false
+}
+```
+
+Секундой позже тот же заказ выглядит так:
+
+```json
+{
+  "order": { "status": "partially_delivered", "items": [
+    { "sku": "KEY-CS2-PRIME", "status": "delivered",
+      "code": "EXTA-KEY-CS2-PRIME-00000", "supplier": "a" },
+    { "sku": "KEY-EFT",       "status": "refunded" },
+    { "sku": "GIFT-PSN-1000", "status": "delivered",
+      "code": "EXTA-GIFT-PSN-1000-00000", "supplier": "a" } ] },
+  "money": { "equation": "578000 = 229000 + 349000 + 0", "balanced": true },
+  "events_applied": 16,
+  "final": true
+}
+```
+
+Ошибки: `404` - на этот момент заказа ещё не существовало (или его нет вовсе).
+
+### `GET /admin/money/as-of` - деньги на прошлый момент
+
+Параметр `at`. Тот же денежный блок, но по всей базе на указанный момент.
+Инвариант выполняется на любом срезе, а не только на текущем.
+
+### `GET /admin/reports/period` - итоги за период
+
+Параметры `from` и `to` (ISO-8601). `to` должен быть позже `from`, иначе `422`.
+
+```json
+{
+  "from": "2026-09-08T10:22:35.981000+00:00",
+  "to":   "2026-09-08T10:25:52+00:00",
+  "money": {
+    "paid_minor": 1978000,
+    "delivered_minor": 1629000,
+    "refunded_minor": 349000,
+    "cost_minor": 1140300,
+    "open_delta_minor": 0,
+    "equation": "1978000 = 1629000 + 349000 + 0",
+    "balanced": true
+  },
+  "orders_touched": 27,
+  "events": [
+    { "type": "item_refunded", "n": 1 },
+    { "type": "item_status",   "n": 301 },
+    { "type": "order_created", "n": 26 },
+    { "type": "order_paid",    "n": 27 },
+    { "type": "order_status",  "n": 27 }
+  ]
+}
+```
+
+`open_delta_minor` - прирост незакрытых обязательств за период: заказы,
+оплаченные внутри окна, но выданные или возвращённые уже за его границей.
+Итог за период равен разности двух срезов `/admin/money/as-of` - одно и то же
+число, посчитанное двумя независимыми способами.
 
 ---
 
@@ -439,30 +722,52 @@ liveness, а не readiness.
 
 ---
 
-## Статусы заказа
+## Статусы заказа и позиции
+
+Заказ - агрегат над позициями, его статус считается из их статусов.
 
 ```
-created ──> paid ──> delivering ──> delivered      (основной путь)
-   │                      │
-   │                      ├─> out_of_stock ──┐
-   │                      └─> delivery_failed ┴──> (пополнение / выздоровление) ──> delivered
-   └─> payment_failed
+позиция:  pending ─> delivering ─> delivered
+                          │
+                          ├─> out_of_stock ────┐  (завоз)
+                          ├─> delivery_failed ─┤  (поставщик ожил)  ─> delivered
+                          └─> unavailable ─────┴─> refunded
+
+заказ:    created ─> paid ─> delivering ─> delivered            (выдали всё)
+             │                          └─> partially_delivered (часть вернули)
+             │                          └─> refunded            (не выдали ничего)
+             └─> payment_failed
 ```
 
-| Статус | Смысл | Финальный? |
-|--------|-------|-----------|
+| Статус заказа | Смысл | Финальный? |
+|---------------|-------|-----------|
 | `created` | заказ создан, ждём оплату | нет |
 | `paid` | оплата подтверждена, выдача поставлена в очередь | нет |
-| `delivering` | идёт получение кода у поставщика | нет |
-| `delivered` | код выдан и привязан к заказу | **да** |
+| `delivering` | идёт получение кодов у поставщиков | нет |
+| `delivered` | выданы все позиции | **да** |
+| `partially_delivered` | часть выдана, за остальное деньги возвращены | **да** |
+| `refunded` | не выдано ничего, деньги возвращены целиком | **да** |
 | `payment_failed` | оплата не прошла | **да** |
-| `out_of_stock` | оплачено, но кода нет в наличии | нет, восстановимый |
-| `delivery_failed` | оба поставщика не смогли выдать | нет, восстановимый |
+| `out_of_stock` | оплачено, но кодов нет в наличии | нет, восстановимый |
+| `delivery_failed` | выдать не удалось | нет, восстановимый |
 
-Из финальных статусов система не выходит никогда: повторная оплата уже выданного
-заказа - no-op, повторная выдача - тоже. Восстановимые статусы, наоборот,
-не требуют ручного вмешательства: фоновая задача продолжает попытки с бэкоффом,
-и как только остаток пополнился или поставщик ожил, заказ доводится сам.
+| Статус позиции | Смысл |
+|----------------|-------|
+| `pending` | ждёт оплаты или своей очереди на выдачу |
+| `delivering` | идёт запрос к поставщику |
+| `delivered` | код у покупателя |
+| `out_of_stock` | ни у одного поставщика нет кода, но завезут |
+| `delivery_failed` | выдать не удалось, повтор имеет смысл |
+| `unavailable` | выдать нельзя в принципе, ждать нечего |
+| `refunded` | деньги за позицию возвращены |
+
+Позиция закрывается ровно одним способом: кодом либо деньгами. Отсюда и
+сходимость `оплачено = выдано + возвращено`.
+
+Из финальных статусов система не выходит: повторная оплата уже выданного заказа
+no-op, повторная выдача тоже. Восстановимые статусы не требуют ручного
+вмешательства: фоновая задача продолжает попытки с бэкоффом, а когда бюджет
+попыток исчерпан, невыданное закрывается возвратом и заказ приходит к финалу сам.
 
 Отдельно стоит `delivering` с `last_error = "unresolved supplier outcome: ..."`.
 Это не ошибка, а честное «мы не знаем, выдал поставщик код или нет». Пока не
@@ -508,6 +813,31 @@ created ──> paid ──> delivering ──> delivered      (основной
 | `404 {"status":"not_found"}` | такого запроса не было, код точно не выдавался - можно идти к другому поставщику |
 | таймаут / `504` | исход по-прежнему неизвестен, ждём и повторяем |
 
+### `GET /{s}/codes/{code}` - кому принадлежит код
+
+Единственный внешний способ проверить ответ поставщика: сам ответ может быть
+каким угодно, а пул ключей врать не умеет. По этой ручке ядро отвергает чужие
+коды до того, как они уйдут покупателю.
+
+```json
+{ "code": "EXTA-STEAM-TOPUP-1000-00000", "sku": "STEAM-TOPUP-1000",
+  "state": "issued", "request_id": "req_ord_3df5e7ec011745da.1-a" }
+```
+
+`404`, если поставщик такого кода не знает. Для ядра это тоже расхождение
+(`unknown_code`): код, который поставщик прислал, но не признаёт, клиенту не
+уходит.
+
+### `GET /{s}/_stats` - счётчики лимита
+
+```json
+{ "supplier": "a", "rate_limit": 20, "rate_window_seconds": 1.0,
+  "accepted": 24, "rejected_429": 0, "over_limit": 0, "max_in_window": 5 }
+```
+
+Считает сама заглушка, а не клиент: «лимит не превышен» должно быть словом
+поставщика. `POST /{s}/_stats/reset` обнуляет.
+
 ### `GET /{s}/stock` - остатки
 
 ```json
@@ -522,14 +852,17 @@ created ──> paid ──> delivering ──> delivered      (основной
 
 | Поле | По умолчанию | Что делает |
 |------|--------------|-----------|
-| `mode` | `random` | `ok`, `error_5xx`, `out_of_stock`, `timeout`, `timeout_after_issue`, `refuse`, `random` |
+| `mode` | `random` | `ok`, `error_5xx`, `out_of_stock`, `timeout`, `timeout_after_issue`, `refuse`, `duplicate_code`, `foreign_code`, `error_after_issue`, `random` |
 | `error_rate` | `0.0` | доля 5xx в режиме `random` |
 | `timeout_rate` | `0.0` | доля таймаутов в режиме `random` |
 | `timeout_after_issue_share` | `0.5` | какая часть таймаутов приходится на «код уже выдан» |
 | `hang_seconds` | `10.0` | сколько висеть в режимах с таймаутом |
 | `latency_ms` | `0` | искусственная задержка на каждый запрос |
-| `out_of_stock_skus` | `[]` | какие SKU считать распроданными |
+| `out_of_stock_skus` | `[]` | какие SKU считать распроданными (лечится завозом) |
+| `unsupported_skus` | `[]` | какие SKU не продаём вовсе: `410`, отказ навсегда |
 | `probe_hangs` | `false` | статус-запрос тоже зависает: исход становится неразрешимым |
+| `rate_limit` | `0` | сколько запросов на выдачу принимать за окно, `0` - без лимита |
+| `rate_window_seconds` | `60.0` | длина скользящего окна лимита |
 
 Режимы, ради которых всё это затевалось:
 
@@ -540,6 +873,19 @@ created ──> paid ──> delivering ──> delivered      (основной
 - `refuse` - мгновенный `503`. Поставщик ответил, значит точно ничего не выдал.
 - `probe_hangs` + `timeout_after_issue` - худший случай: исход выяснить нечем.
   Единственное безопасное поведение - ждать и повторять тем же `request_id`.
+
+Режимы недобросовестного поставщика, ответу в них верить нельзя:
+
+- `duplicate_code` - отдаёт код, уже выданный другому запросу. Пул при этом не
+  трогается: настоящий владелец кода остаётся прежним, иначе подлог нельзя было
+  бы обнаружить снаружи.
+- `foreign_code` - отдаёт код от другого товара.
+- `error_after_issue` - записывает выдачу у себя и отвечает `500`. По ответу
+  кажется, что выдачи не было; уход к резервному поставщику дал бы второй код.
+
+Отдельно от `out_of_stock` стоит `unsupported_skus`: `410 sku_not_supported`.
+Первое лечится завозом, второе не лечится ничем - на этой разнице ядро решает,
+ждать дальше или возвращать деньги.
 
 ```bash
 curl -sX POST localhost:9101/a/_control -H 'content-type: application/json' \
@@ -565,24 +911,39 @@ curl -s localhost:9101/a/_control            # посмотреть текущи
 ## Сквозной сценарий целиком
 
 ```bash
-# 1. создаём заказ
-ORDER=$(curl -sX POST localhost:8000/orders \
-          -H 'content-type: application/json' \
-          -d '{"sku":"KEY-CS2-PRIME"}' | jq -r .id)
+# 1. заказ из трёх товаров, один из которых поставщики не продают
+curl -sX POST localhost:9101/a/_control -H 'content-type: application/json' \
+  -d '{"unsupported_skus":["KEY-EFT"]}'
+curl -sX POST localhost:9102/b/_control -H 'content-type: application/json' \
+  -d '{"unsupported_skus":["KEY-EFT"]}'
+
+ORDER=$(curl -sX POST localhost:8000/orders -H 'content-type: application/json' \
+  -d '{"items":[{"sku":"KEY-CS2-PRIME"},{"sku":"KEY-EFT"},{"sku":"GIFT-PSN-1000"}]}' \
+  | jq -r .id)
 
 # 2. платёжка присылает вебхук (тут - эмулятор)
 python -m scripts.payment_sim pay --order $ORDER
 
-# 3. через долю секунды код уже выдан
-curl -s localhost:8000/orders/$ORDER | jq '{status, code: .issuance.code}'
-# { "status": "delivered", "code": "YPLV-QK2Z-IUS5" }
+# 3. через пару секунд заказ закрыт: два кода выданы, за третий деньги вернулись
+curl -s localhost:8000/orders/$ORDER \
+  | jq '{status, items: [.items[] | {sku, status, code: .issuance.code}]}'
+# "partially_delivered", два кода и одна позиция в "refunded"
 
-# 4. смотрим, как именно он туда попал
-curl -s localhost:8000/admin/orders/$ORDER/timeline | jq '.supplier_attempts'
+# 4. смотрим, как именно это произошло
+curl -s localhost:8000/admin/orders/$ORDER/timeline \
+  | jq '{items, attempts: .supplier_attempts, discrepancies: .supplier_discrepancies}'
 
 # 5. проверяем, что деньги сходятся
-curl -s localhost:8000/admin/ledger/balance | jq '{balanced, total_minor}'
+curl -s localhost:8000/admin/money | jq '{equation, balanced}'
+# { "equation": "578000 = 229000 + 349000 + 0", "balanced": true }
+
+# 6. и что было с заказом минуту назад
+curl -s "localhost:8000/admin/orders/$ORDER/as-of?at=$(date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%SZ)" \
+  | jq '{status: .order.status, money: .money.equation}'
 ```
 
-Сценарии посложнее - гонки, ловушка таймаута, фолбэк, пустой остаток - собраны
-в `make race`, `make trap`, `make fallback`, `make stock`. Подробности в README.
+Сценарии посложнее - гонки, ловушка таймаута, фолбэк, пустой остаток,
+недобросовестный поставщик, всплеск под лимитом - собраны в `make race`,
+`make trap`, `make fallback`, `make stock` и в тестах
+(`make test-partial`, `make test-untrusted`, `make test-burst`,
+`make test-history`). Подробности в README.

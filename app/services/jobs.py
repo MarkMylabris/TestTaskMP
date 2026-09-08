@@ -1,12 +1,12 @@
 """Очередь фоновых задач на самом PostgreSQL.
 
-Отдельный брокер тут не нужен и даже вреден: задача ставится в той же
-транзакции, что и смена статуса заказа (транзакционный outbox), а с внешней
-очередью пришлось бы решать, что делать, если транзакция закоммитилась, а
-публикация в брокер упала.
+Внешний брокер тут вреден: задача ставится в одной транзакции со сменой
+статуса заказа (outbox), а с брокером пришлось бы решать, что делать, если
+транзакция закоммитилась, а публикация упала.
 
-Разбор - через FOR UPDATE SKIP LOCKED, так что воркеров можно поднять сколько
-угодно, и одну задачу никогда не возьмут двое.
+Разбор через FOR UPDATE SKIP LOCKED: воркеров можно поднять сколько угодно,
+одну задачу не возьмут двое. Порядок - сначала приоритет, потом время: при
+всплеске лимит поставщика тратится на тех, кто уже заплатил.
 """
 from __future__ import annotations
 
@@ -18,13 +18,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Job
 
-# Предикат частичного уникального индекса - нужен PostgreSQL для inference в ON CONFLICT.
+# Предикат частичного индекса: нужен для inference в ON CONFLICT.
 _ACTIVE = text("state IN ('pending','running')")
 
 KIND_DELIVER = "deliver_order"
 KIND_APPLY_ORPHAN = "apply_orphan_events"
 KIND_SYNC_STOCK = "sync_stock"
-KIND_RESOLVE_UNKNOWN = "resolve_unknown_attempt"
+KIND_REFUND_ITEM = "refund_item"
+
+# Меньше - раньше.
+PRIORITY = {
+    KIND_DELIVER: 0,          # оплаченный заказ ждёт код
+    KIND_REFUND_ITEM: 10,     # деньги уже у нас, вернуть их - следующий по важности
+    KIND_APPLY_ORPHAN: 20,    # платёж без заказа: заказ ещё даже не создан
+    KIND_SYNC_STOCK: 50,      # витрина подождёт
+}
+DEFAULT_PRIORITY = 100
 
 
 def backoff_delay(attempts: int, base: float = 0.5, cap: float = 60.0) -> timedelta:
@@ -39,11 +48,11 @@ async def enqueue(
     *,
     delay: timedelta | None = None,
     max_attempts: int = 25,
+    priority: int | None = None,
 ) -> bool:
-    """Поставить задачу. Возвращает False, если такая уже висит в очереди.
+    """Поставить задачу. False, если такая уже висит в очереди.
 
-    Дедупликация - частичный уникальный индекс по (kind, dedupe_key)
-    среди state IN ('pending','running').
+    Дедупликация - частичный уникальный индекс по (kind, dedupe_key).
     """
     run_at = datetime.now(timezone.utc) + (delay or timedelta())
     stmt = (
@@ -54,6 +63,7 @@ async def enqueue(
             payload=payload or {},
             run_at=run_at,
             max_attempts=max_attempts,
+            priority=PRIORITY.get(kind, DEFAULT_PRIORITY) if priority is None else priority,
             state="pending",
         )
         .on_conflict_do_nothing(index_elements=["kind", "dedupe_key"], index_where=_ACTIVE)
@@ -69,10 +79,10 @@ CLAIM_SQL = text(
      WHERE id IN (
            SELECT id FROM jobs
             WHERE state = 'pending' AND run_at <= now()
-            ORDER BY run_at
+            ORDER BY priority, run_at
               FOR UPDATE SKIP LOCKED
             LIMIT :batch)
- RETURNING id, kind, dedupe_key, payload, attempts, max_attempts
+ RETURNING id, kind, dedupe_key, payload, attempts, max_attempts, priority
     """
 )
 
@@ -92,7 +102,7 @@ async def finish(session: AsyncSession, job_id: int) -> None:
 async def retry_later(
     session: AsyncSession, job_id: int, attempts: int, max_attempts: int, error: str
 ) -> None:
-    """Вернуть задачу в очередь с экспоненциальным бэкоффом либо признать провал."""
+    """Бэкофф или признание провала, если попытки кончились."""
     if attempts >= max_attempts:
         await session.execute(
             text("UPDATE jobs SET state='failed', last_error=:e, updated_at=now() WHERE id=:id"),
@@ -109,8 +119,26 @@ async def retry_later(
     )
 
 
+async def requeue_without_penalty(
+    session: AsyncSession, job_id: int, delay: timedelta, note: str
+) -> None:
+    """Вернуть задачу в очередь, не тратя попытку.
+
+    Так возвращается задача, упёршаяся в лимит поставщика: иначе всплеск
+    нагрузки закончился бы возвратами вместо выдач.
+    """
+    run_at = datetime.now(timezone.utc) + delay
+    await session.execute(
+        text(
+            "UPDATE jobs SET state='pending', run_at=:r, last_error=:e, "
+            "attempts = GREATEST(attempts - 1, 0), updated_at=now() WHERE id=:id"
+        ),
+        {"id": job_id, "r": run_at, "e": note[:2000]},
+    )
+
+
 async def reschedule(session: AsyncSession, job_id: int, delay: timedelta, note: str) -> None:
-    """Мягкий перенос (не ошибка): например, ждём пополнения остатка."""
+    """Мягкий перенос, не ошибка: например, ждём завоза остатка."""
     run_at = datetime.now(timezone.utc) + delay
     await session.execute(
         text(

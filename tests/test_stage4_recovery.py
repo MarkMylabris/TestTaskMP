@@ -34,8 +34,16 @@ async def test_ledger_always_balances(api):
     assert balance["unbalanced_transactions"] == []
 
     accounts = {r["account"]: r["total"] for r in balance["by_account"]}
-    assert accounts["customer"] > 0 and accounts["revenue"] < 0
+    assert accounts["revenue"] < 0
     assert accounts["supplier_cost"] > 0 and accounts["inventory"] < 0
+    # Выдача гасит обязательство перед клиентом, поэтому по выданному заказу
+    # на счёте `customer` не остаётся ничего.
+    tl = await timeline(api, order["id"])
+    per_account = {}
+    for e in tl["ledger_entries"]:
+        per_account[e["account"]] = per_account.get(e["account"], 0) + e["amount_minor"]
+    assert per_account["customer"] == 0
+    assert per_account["delivered"] == order["amount_minor"]
 
 
 async def test_ledger_is_not_double_posted_under_webhook_storm(api):

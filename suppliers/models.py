@@ -1,4 +1,4 @@
-"""Состояние заглушек. База отдельная: поставщик - внешняя система, а не наша таблица."""
+"""Состояние заглушек. База отдельная: поставщик - внешняя система."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -45,7 +45,7 @@ class SupplierKey(Base):
 
 
 class SupplierRequest(Base):
-    """Идемпотентность поставщика: один request_id -> один и тот же ответ навсегда."""
+    """Идемпотентность поставщика: один request_id, один ответ навсегда."""
 
     __tablename__ = "supplier_requests"
 
